@@ -1741,3 +1741,13 @@ hr {
 .workspace-label {
   color: #93909e;
 }
+
+.import-notices {
+  padding-left: 20px;
+  color: #8c769d;
+  line-height: 1.8;
+  font-size: 12px;
+}
+.import-notices li + li {
+  margin-top: 7px;
+}

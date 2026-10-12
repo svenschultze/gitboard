@@ -27,7 +27,7 @@ Create a project, then add as many boards as you need. Start blank or use a brai
 
 Use the canvas tools to add sticky notes, text, rectangles, ellipses, diamonds, frames, arrows, lines, freehand drawings, and raster images. Select objects to move, resize, or change their appearance. Double-click text objects, or press Enter with an object selected, to edit their text. Hold Shift to select multiple objects. Alt-drag duplicates the selected objects.
 
-Pan with the hand tool, Space-drag, middle mouse button, or trackpad scroll. Ctrl-scroll or Alt-scroll zooms around the pointer. Export a board as JSON, SVG, or PNG, or export a whole project as JSON. Import project or board JSON to bring work into another workspace. Images are embedded in board data rather than linked to external hosts.
+Pan with the hand tool, Space-drag, middle mouse button, or trackpad scroll. Ctrl-scroll or Alt-scroll zooms around the pointer. Export a board as JSON, SVG, or PNG, or export a whole project as JSON. Use **Import** to bring in a project or board JSON file, or a draw.io diagram. Images are embedded in board data rather than linked to external hosts.
 
 | Action                          | Shortcut                                  |
 | ------------------------------- | ----------------------------------------- |
@@ -43,6 +43,14 @@ Pan with the hand tool, Space-drag, middle mouse button, or trackpad scroll. Ctr
 | Finish / cancel text editing    | Ctrl/Cmd+Enter / Escape                   |
 | Nudge selection                 | Arrow keys (Shift for 10 pixels)          |
 | Fit all content / 100% zoom     | 1 / 0                                     |
+
+## Import draw.io diagrams
+
+Choose **Import → draw.io diagram** and select a `.drawio` or `.xml` file exported by diagrams.net/draw.io. Compressed and uncompressed files are supported, including files with multiple pages and standalone `mxGraphModel` XML. Each page becomes a new board in your current project; your existing boards stay in place.
+
+Imported shapes, labels, lines, arrows, and embedded raster images become editable GitBoard objects. Nested group positions, connector waypoints, colors, font sizes, text alignment, and common shape styles are preserved. HTML labels are converted to plain text. Import notices describe unsupported content; external image URLs and SVG images are omitted. Some specialized draw.io shapes and advanced styles are approximated with GitBoard's available shapes.
+
+Once imported, boards save locally and can be exported as GitBoard JSON or committed to the project's GitHub repository. GitBoard does not export back to draw.io format.
 
 ## Host on GitHub Pages
 
@@ -110,6 +118,7 @@ The site uses native JavaScript modules, HTML, CSS, and an SVG canvas, with no p
 - `js/editor.js` — canvas interaction and rendering.
 - `js/model.js` — portable project schema, templates, validation, local persistence.
 - `js/github.js` — GitHub REST API integration and project synchronization.
+- `js/drawio.js` — draw.io XML decoding and conversion to editable board objects.
 - `tests/` — Node's built-in test runner, including import validation and mocked GitHub requests.
 - `.github/workflows/checks.yml` — syntax checks and tests for pushes and pull requests.
 - `.github/workflows/pages.yml` — checked static site deployment.
@@ -131,3 +140,11 @@ node tests/browser.mjs
 ```
 
 Set `GITBOARD_URL` to test another running server. `GITBOARD_BROWSER_PATH` can select an existing Chrome executable, and `GITBOARD_PLAYWRIGHT_MODULE` can point to an externally installed Playwright module. No real GitHub account or token is used by this suite.
+
+The draw.io browser suite exercises XML parsing, compressed multipage imports, editable objects, persistence, and portable exports:
+
+```sh
+node tests/drawio.browser.mjs
+```
+
+It uses the same browser environment variables as the main suite. Set `GITBOARD_DRAWIO_EXAMPLE` to the local 18-panel reference diagram to verify its 777 objects without storing that file in this repository. Optional `GITBOARD_DRAWIO_SCREENSHOT` and `GITBOARD_DRAWIO_DETAIL_SCREENSHOT` paths capture the imported board and a closer view. `GITBOARD_DRAWIO_BOARD_JSON` saves a converted board JSON file to the supplied path.

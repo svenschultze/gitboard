@@ -415,12 +415,49 @@ export function validateProject(data) {
           fail("images must be embedded PNG, JPEG, WebP, or GIF data.");
         result.src = i.src;
       }
-      for (const key of ["strokeWidth", "fontWeight", "opacity"])
+      for (const key of [
+        "strokeWidth",
+        "fontWeight",
+        "opacity",
+        "cornerRadius",
+        "textPadding",
+      ])
         if (i[key] !== undefined) result[key] = finite(i[key], key, true);
       if (i.align !== undefined) {
         if (!["left", "center", "right"].includes(i.align))
           fail("invalid text alignment.");
         result.align = i.align;
+      }
+      if (i.verticalAlign !== undefined) {
+        if (!["top", "middle", "bottom"].includes(i.verticalAlign))
+          fail("invalid vertical text alignment.");
+        result.verticalAlign = i.verticalAlign;
+      }
+      if (i.fontFamily !== undefined) {
+        if (
+          typeof i.fontFamily !== "string" ||
+          !/^[A-Za-z0-9][A-Za-z0-9 _,-]{0,99}$/.test(i.fontFamily)
+        )
+          fail("invalid font family.");
+        result.fontFamily = i.fontFamily;
+      }
+      for (const key of ["wrap", "underline", "startArrow", "endArrow"]) {
+        if (i[key] !== undefined) {
+          if (typeof i[key] !== "boolean") fail(`${key} must be a boolean.`);
+          result[key] = i[key];
+        }
+      }
+      for (const key of ["startAnchor", "endAnchor"]) {
+        if (i[key] !== undefined) {
+          const anchor = i[key];
+          if (!anchor || typeof anchor !== "object" || Array.isArray(anchor))
+            fail("invalid connector anchor.");
+          const x = finite(anchor.x, "anchor x"),
+            y = finite(anchor.y, "anchor y");
+          if (x < 0 || x > 1 || y < 0 || y > 1)
+            fail("connector anchors must be between 0 and 1.");
+          result[key] = { x, y };
+        }
       }
       for (const key of ["locked", "bold", "italic", "dashed"])
         if (i[key] !== undefined) result[key] = Boolean(i[key]);

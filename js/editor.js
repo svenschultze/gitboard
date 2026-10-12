@@ -200,7 +200,7 @@ export class BoardEditor {
       this.undoStack = [];
       this.redoStack = [];
       this.view = { x: 0, y: 0, zoom: 1, ...board.view };
-      this.view.zoom = clamp(Number(this.view.zoom) || 1, 0.1, 4);
+      this.view.zoom = clamp(Number(this.view.zoom) || 1, 0.05, 4);
     }
     this.selected = new Set(
       [...this.selected].filter((id) =>
@@ -356,30 +356,50 @@ export class BoardEditor {
       ? { x: end.x + end.width / 2, y: end.y + end.height / 2 }
       : { x: points.at(-1)[0], y: points.at(-1)[1] };
     const boundary = (target, origin, toward) => {
+      const halfWidth = Math.max(target.width / 2, 0.000001);
+      const halfHeight = Math.max(target.height / 2, 0.000001);
       const dx = toward.x - origin.x,
         dy = toward.y - origin.y;
       if (!dx && !dy) return [origin.x, origin.y];
       let scale;
       if (target.type === "ellipse")
-        scale =
-          1 /
-          Math.sqrt(
-            (dx / (target.width / 2)) ** 2 + (dy / (target.height / 2)) ** 2,
-          );
+        scale = 1 / Math.sqrt((dx / halfWidth) ** 2 + (dy / halfHeight) ** 2);
       else if (target.type === "diamond")
-        scale =
-          1 /
-          (Math.abs(dx) / (target.width / 2) +
-            Math.abs(dy) / (target.height / 2));
+        scale = 1 / (Math.abs(dx) / halfWidth + Math.abs(dy) / halfHeight);
       else
         scale = Math.min(
-          dx ? Math.abs(target.width / 2 / dx) : Infinity,
-          dy ? Math.abs(target.height / 2 / dy) : Infinity,
+          dx ? Math.abs(halfWidth / dx) : Infinity,
+          dy ? Math.abs(halfHeight / dy) : Infinity,
         );
       return [origin.x + dx * scale, origin.y + dy * scale];
     };
-    if (start) points[0] = boundary(start, startCenter, endCenter);
-    if (end) points[points.length - 1] = boundary(end, endCenter, startCenter);
+    const anchoredPoint = (target, anchor) => [
+      target.x + target.width * anchor.x,
+      target.y + target.height * anchor.y,
+    ];
+    const startPort =
+      start && item.startAnchor ? anchoredPoint(start, item.startAnchor) : null;
+    const endPort =
+      end && item.endAnchor ? anchoredPoint(end, item.endAnchor) : null;
+    if (start) {
+      const toward =
+        points.length > 2
+          ? { x: points[1][0], y: points[1][1] }
+          : endPort
+            ? { x: endPort[0], y: endPort[1] }
+            : endCenter;
+      points[0] = startPort || boundary(start, startCenter, toward);
+    }
+    if (end) {
+      const previous = points.at(-2);
+      const toward =
+        points.length > 2
+          ? { x: previous[0], y: previous[1] }
+          : startPort
+            ? { x: startPort[0], y: startPort[1] }
+            : startCenter;
+      points[points.length - 1] = endPort || boundary(end, endCenter, toward);
+    }
     return points;
   }
 
@@ -398,12 +418,43 @@ export class BoardEditor {
       }
     }
     const result = boundsOf(item);
-    return {
+    const rect = {
       x: result.x,
       y: result.y,
       width: result.width,
       height: result.height,
     };
+    if (
+      item.text &&
+      textTypes.has(item.type) &&
+      (item.wrap === false || item.type === "frame")
+    ) {
+      const layout = this.textLayout(item);
+      const textWidth = Math.max(
+        0,
+        ...layout.lines.map(
+          (line) => this.measureContext.measureText(line).width,
+        ),
+      );
+      const textX =
+        layout.align === "left"
+          ? layout.x
+          : layout.align === "right"
+            ? layout.x - textWidth
+            : layout.x - textWidth / 2;
+      return unitedBounds([
+        rect,
+        {
+          x: textX,
+          y: layout.y - layout.fontSize,
+          width: textWidth,
+          height:
+            layout.fontSize +
+            Math.max(0, layout.lines.length - 1) * layout.lineHeight,
+        },
+      ]);
+    }
+    return rect;
   }
 
   selectionBounds() {
@@ -484,13 +535,32 @@ export class BoardEditor {
   deleteSelected() {
     this.finishEditing();
     if (!this.selected.size) return;
-    const before = clone(this.items);
-    this.items = this.items.filter(
-      (item) => !this.selected.has(item.id) || item.locked,
+    const removed = new Set(
+      this.items
+        .filter((item) => this.selected.has(item.id) && !item.locked)
+        .map((item) => item.id),
     );
+    if (!removed.size) return;
+    const before = clone(this.items);
     this.items.forEach((item) => {
-      if (this.selected.has(item.startId)) delete item.startId;
-      if (this.selected.has(item.endId)) delete item.endId;
+      if (
+        pathTypes.has(item.type) &&
+        (removed.has(item.startId) || removed.has(item.endId))
+      ) {
+        item.points = this.connectorPoints(item);
+        this.updatePathBounds(item);
+      }
+    });
+    this.items = this.items.filter((item) => !removed.has(item.id));
+    this.items.forEach((item) => {
+      if (removed.has(item.startId)) {
+        delete item.startId;
+        delete item.startAnchor;
+      }
+      if (removed.has(item.endId)) {
+        delete item.endId;
+        delete item.endAnchor;
+      }
     });
     this.selected.clear();
     this.render();
@@ -506,6 +576,12 @@ export class BoardEditor {
   }
 
   insertCopies(originals, dx, dy) {
+    if (this.items.length + originals.length > 20000) {
+      this.callbacks.onError?.(
+        "A board can contain up to 20,000 objects. Paste these objects into another board.",
+      );
+      return;
+    }
     const before = clone(this.items);
     const ids = new Map(originals.map((item) => [item.id, uid()]));
     const copies = originals.map((original) => {
@@ -518,8 +594,14 @@ export class BoardEditor {
           point[0] + dx,
           point[1] + dy,
         ]);
-      if (item.startId) item.startId = ids.get(item.startId);
-      if (item.endId) item.endId = ids.get(item.endId);
+      if (item.startId) {
+        item.startId = ids.get(item.startId);
+        if (!item.startId) delete item.startAnchor;
+      }
+      if (item.endId) {
+        item.endId = ids.get(item.endId);
+        if (!item.endId) delete item.endAnchor;
+      }
       return item;
     });
     this.items.push(...copies);
@@ -575,6 +657,7 @@ export class BoardEditor {
       item.points = this.connectorPoints(item);
       const attachment = endpoint === "0" ? "startId" : "endId";
       delete item[attachment];
+      delete item[attachment === "startId" ? "startAnchor" : "endAnchor"];
       this.gesture = {
         kind: "endpoint",
         id: item.id,
@@ -742,8 +825,14 @@ export class BoardEditor {
           const movingIds = new Set(
             gesture.originals.map((original) => original.id),
           );
-          if (!movingIds.has(original.startId)) delete item.startId;
-          if (!movingIds.has(original.endId)) delete item.endId;
+          if (!movingIds.has(original.startId)) {
+            delete item.startId;
+            delete item.startAnchor;
+          }
+          if (!movingIds.has(original.endId)) {
+            delete item.endId;
+            delete item.endAnchor;
+          }
         }
       });
     } else if (gesture.kind === "endpoint") {
@@ -862,6 +951,8 @@ export class BoardEditor {
         ]);
         delete item.startId;
         delete item.endId;
+        delete item.startAnchor;
+        delete item.endAnchor;
         this.updatePathBounds(item);
       }
     });
@@ -951,13 +1042,16 @@ export class BoardEditor {
     if (!item || !textTypes.has(item.type) || item.locked) return;
     this.finishEditing();
     this.selected = new Set([item.id]);
-    const padding = item.type === "text" || item.type === "frame" ? 0 : 16;
+    const layout = this.textLayout(item);
+    const padding = layout.padding;
     const foreign = svgElement("foreignObject", {
       x: item.x + padding,
-      y: item.type === "frame" ? item.y - 30 : item.y + padding,
+      y: item.type === "frame" ? item.y - 30 : item.y + layout.verticalPadding,
       width: Math.max(40, item.width - padding * 2),
       height:
-        item.type === "frame" ? 32 : Math.max(30, item.height - padding * 2),
+        item.type === "frame"
+          ? 32
+          : Math.max(30, item.height - layout.verticalPadding * 2),
       class: "board-editor__text-edit",
     });
     const textarea = document.createElementNS(XHTML, "textarea");
@@ -965,7 +1059,12 @@ export class BoardEditor {
     textarea.value = item.text || "";
     textarea.setAttribute("aria-label", "Edit object text");
     textarea.setAttribute("placeholder", "Type something…");
-    textarea.style.fontSize = `${item.fontSize || 20}px`;
+    textarea.style.fontSize = `${layout.fontSize}px`;
+    textarea.style.fontFamily = this.fontFamily(item);
+    textarea.style.lineHeight = "1.35";
+    textarea.style.textDecoration = item.underline ? "underline" : "none";
+    textarea.style.whiteSpace = item.wrap === false ? "pre" : "pre-wrap";
+    textarea.setAttribute("wrap", item.wrap === false ? "off" : "soft");
     textarea.style.color = item.textColor || item.stroke || "#292d38";
     textarea.style.fontWeight = item.bold
       ? "700"
@@ -974,13 +1073,15 @@ export class BoardEditor {
     textarea.style.textAlign =
       item.align ||
       (item.type === "text" || item.type === "frame" ? "left" : "center");
-    textarea.style.paddingTop =
-      item.type === "sticky" ||
-      item.type === "rect" ||
-      item.type === "ellipse" ||
-      item.type === "diamond"
-        ? `${Math.max(0, (item.height - padding * 2 - (item.fontSize || 20) * 1.4) / 2 - 4)}px`
-        : "0";
+    const updateTextPadding = () => {
+      const lines = this.textLayout(item, textarea.value).lines.length || 1;
+      const free = Math.max(
+        0,
+        item.height - layout.verticalPadding * 2 - layout.lineHeight * lines,
+      );
+      textarea.style.paddingTop = `${layout.verticalAlign === "bottom" ? free : layout.verticalAlign === "middle" ? free / 2 : 0}px`;
+    };
+    updateTextPadding();
     textarea.addEventListener("pointerdown", (event) =>
       event.stopPropagation(),
     );
@@ -994,13 +1095,7 @@ export class BoardEditor {
         this.finishEditing();
       }
     });
-    textarea.addEventListener("input", () => {
-      const lines = textarea.value.split("\n").length;
-      textarea.style.paddingTop =
-        item.type === "text" || item.type === "frame"
-          ? "0"
-          : `${Math.max(0, (item.height - padding * 2 - (item.fontSize || 20) * 1.4 * lines) / 2 - 4)}px`;
-    });
+    textarea.addEventListener("input", updateTextPadding);
     textarea.addEventListener("blur", () => {
       if (this.editing?.textarea === textarea) this.finishEditing();
     });
@@ -1055,7 +1150,7 @@ export class BoardEditor {
 
   zoomAt(factor, point) {
     const oldZoom = this.view.zoom;
-    const zoom = clamp(oldZoom * factor, 0.1, 4);
+    const zoom = clamp(oldZoom * factor, 0.05, 4);
     this.view.x = point.x - ((point.x - this.view.x) / oldZoom) * zoom;
     this.view.y = point.y - ((point.y - this.view.y) / oldZoom) * zoom;
     this.view.zoom = zoom;
@@ -1088,7 +1183,7 @@ export class BoardEditor {
           (width - 160) / Math.max(rect.width, 1),
           (height - 150) / Math.max(rect.height, 1),
         ),
-        0.1,
+        0.05,
         2,
       );
       this.view = {
@@ -1272,7 +1367,7 @@ export class BoardEditor {
   }
 
   sanitizeClipboardItems(items) {
-    if (!Array.isArray(items) || items.length > 500) return null;
+    if (!Array.isArray(items) || items.length > 20000) return null;
     try {
       return validateProject({
         schemaVersion: 1,
@@ -1420,7 +1515,7 @@ export class BoardEditor {
     const shapeAttrs = {
       fill,
       stroke,
-      "stroke-width": item.strokeWidth || 2,
+      "stroke-width": item.strokeWidth ?? 2,
       ...(item.dashed ? { "stroke-dasharray": "7 5" } : {}),
     };
     if (item.type === "sticky") {
@@ -1456,7 +1551,14 @@ export class BoardEditor {
       );
     } else if (item.type === "rect")
       group.append(
-        svgElement("rect", { x, y, width, height, rx: 8, ...shapeAttrs }),
+        svgElement("rect", {
+          x,
+          y,
+          width,
+          height,
+          rx: clamp(item.cornerRadius ?? 8, 0, Math.min(width, height) / 2),
+          ...shapeAttrs,
+        }),
       );
     else if (item.type === "ellipse")
       group.append(
@@ -1482,11 +1584,11 @@ export class BoardEditor {
           y,
           width,
           height,
-          rx: 8,
+          rx: clamp(item.cornerRadius ?? 8, 0, Math.min(width, height) / 2),
           fill: fill === "transparent" ? "#ffffff" : fill,
           "fill-opacity": fill === "transparent" ? 0.35 : 1,
           stroke: item.stroke === "#373b48" ? "#acb4c4" : stroke,
-          "stroke-width": 1.5,
+          "stroke-width": item.strokeWidth ?? 1.5,
           "stroke-dasharray": "8 5",
         }),
       );
@@ -1532,11 +1634,14 @@ export class BoardEditor {
           d,
           fill: "none",
           stroke,
-          "stroke-width": item.strokeWidth || (item.type === "draw" ? 3 : 2),
+          "stroke-width": item.strokeWidth ?? (item.type === "draw" ? 3 : 2),
           "stroke-linecap": "round",
           "stroke-linejoin": "round",
           ...(item.dashed ? { "stroke-dasharray": "7 5" } : {}),
-          ...(item.type === "arrow"
+          ...(item.startArrow
+            ? { "marker-start": `url(#${this.id}-arrow)` }
+            : {}),
+          ...((item.endArrow ?? item.type === "arrow")
             ? { "marker-end": `url(#${this.id}-arrow)` }
             : {}),
         }),
@@ -1569,10 +1674,24 @@ export class BoardEditor {
     return group;
   }
 
-  wrappedLines(text, width, fontSize) {
+  fontFamily(item) {
+    return typeof item.fontFamily === "string" &&
+      /^[A-Za-z0-9][A-Za-z0-9 _,-]{0,99}$/.test(item.fontFamily)
+      ? `${item.fontFamily}, Arial, sans-serif`
+      : "Inter, Arial, sans-serif";
+  }
+
+  fontWeight(item) {
+    return item.bold
+      ? 700
+      : item.fontWeight || (item.type === "frame" ? 600 : 500);
+  }
+
+  wrappedLines(text, width, fontSize, item = {}) {
     if (!text) return [];
     const context = this.measureContext;
-    context.font = `500 ${fontSize}px Inter, Arial, sans-serif`;
+    context.font = `${item.italic ? "italic " : ""}${this.fontWeight(item)} ${fontSize}px ${this.fontFamily(item)}`;
+    if (item.wrap === false) return String(text).split("\n");
     const lines = [];
     String(text)
       .split("\n")
@@ -1608,21 +1727,41 @@ export class BoardEditor {
     return lines;
   }
 
-  appendText(group, item) {
-    if (!item.text) return;
+  textLayout(item, value = item.text) {
     const fontSize = clamp(Number(item.fontSize) || 20, 8, 120);
     const left = item.type === "text" || item.type === "frame";
     const align = item.align || (left ? "left" : "center");
-    const padding = left ? 0 : item.type === "diamond" ? item.width * 0.2 : 16;
+    const padding = clamp(
+      item.textPadding ??
+        (left ? 0 : item.type === "diamond" ? item.width * 0.2 : 16),
+      0,
+      Math.max(0, item.width / 2),
+    );
+    const verticalPadding = clamp(
+      item.textPadding ?? (left ? 0 : 16),
+      0,
+      Math.max(0, item.height / 2),
+    );
     const lines = this.wrappedLines(
-      item.text,
+      value,
       Math.max(20, item.width - padding * 2),
       fontSize,
+      item,
     );
     const lineHeight = fontSize * 1.35;
     const availableHeight =
-      item.type === "frame" ? Infinity : item.height - (left ? 0 : 20);
-    const maximum = Math.max(1, Math.floor(availableHeight / lineHeight));
+      item.type === "frame"
+        ? Infinity
+        : item.height -
+          (item.textPadding === undefined
+            ? left
+              ? 0
+              : 20
+            : verticalPadding * 2);
+    const maximum =
+      item.wrap === false
+        ? Infinity
+        : Math.max(1, Math.floor(availableHeight / lineHeight));
     const visible = lines.slice(0, maximum);
     if (lines.length > maximum)
       visible[maximum - 1] = `${visible[maximum - 1].replace(/\s+\S*$/, "")}…`;
@@ -1632,28 +1771,62 @@ export class BoardEditor {
         : align === "right"
           ? item.x + item.width - padding
           : item.x + item.width / 2;
+    const verticalAlign = item.verticalAlign || (left ? "top" : "middle");
+    const textHeight = visible.length * lineHeight;
     const y =
-      item.type === "frame"
+      item.type === "frame" && item.verticalAlign === undefined
         ? item.y - 12
-        : left
-          ? item.y + fontSize
-          : item.y + (item.height - visible.length * lineHeight) / 2 + fontSize;
-    const text = svgElement("text", {
+        : verticalAlign === "bottom"
+          ? item.y + item.height - verticalPadding - textHeight + fontSize
+          : verticalAlign === "middle"
+            ? item.y + (item.height - textHeight) / 2 + fontSize
+            : item.y + verticalPadding + fontSize;
+    return {
+      fontSize,
+      align,
+      padding,
+      verticalPadding,
+      lines: visible,
+      lineHeight,
       x,
       y,
+      verticalAlign,
+    };
+  }
+
+  appendText(group, item) {
+    if (!item.text) return;
+    const layout = this.textLayout(item);
+    const text = svgElement("text", {
+      x: layout.x,
+      y: layout.y,
       fill: item.textColor || item.stroke || "#292d38",
-      "font-family": "Inter, Arial, sans-serif",
-      "font-size": fontSize,
-      "font-weight": item.bold
-        ? 700
-        : item.fontWeight || (item.type === "frame" ? 600 : 500),
+      "font-family": this.fontFamily(item),
+      "font-size": layout.fontSize,
+      "font-weight": this.fontWeight(item),
       "font-style": item.italic ? "italic" : "normal",
+      "text-decoration": item.underline ? "underline" : "none",
       "text-anchor":
-        align === "left" ? "start" : align === "right" ? "end" : "middle",
+        layout.align === "left"
+          ? "start"
+          : layout.align === "right"
+            ? "end"
+            : "middle",
       "pointer-events": "none",
     });
-    visible.forEach((line, index) => {
-      const span = svgElement("tspan", { x, dy: index ? lineHeight : 0 });
+    if (item.wrap === false) {
+      text.setAttributeNS(
+        "http://www.w3.org/XML/1998/namespace",
+        "xml:space",
+        "preserve",
+      );
+      text.style.whiteSpace = "pre";
+    }
+    layout.lines.forEach((line, index) => {
+      const span = svgElement("tspan", {
+        x: layout.x,
+        dy: index ? layout.lineHeight : 0,
+      });
       span.textContent = line || "\u00a0";
       text.append(span);
     });

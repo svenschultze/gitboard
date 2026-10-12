@@ -11,6 +11,7 @@ import {
 } from "./model.js";
 import { BoardEditor } from "./editor.js";
 import { GitHubClient } from "./github.js";
+import { importDrawio } from "./drawio.js";
 import { icon } from "./icons.js";
 
 const $ = (s, root = document) => root.querySelector(s);
@@ -65,7 +66,8 @@ const pendingRepositories = new Map(
 );
 let currentSelection = [],
   currentView = { zoom: 1 },
-  saveFailed = false;
+  saveFailed = false,
+  importBusy = false;
 const project = () =>
   projects.find((p) => p.id === activeProjectId) ?? projects[0];
 const board = () =>
@@ -91,7 +93,7 @@ $("#app").innerHTML = `
   </aside>
   <main class="main">
     <header class="topbar"><div class="breadcrumb">${iconButton("toggle-sidebar", "Toggle sidebar", "menu")}<span id="breadcrumb-project"></span>${icon("right", 13)}<strong id="breadcrumb-board"></strong></div><div class="topbar-actions"><span class="local-status" id="save-status"><span></span>Saved locally</span>${button("github", "Connect GitHub", "github", "secondary-button", 'id="github-top"')}</div></header>
-    <div class="board-heading"><div class="board-heading-left"><span class="board-symbol">${icon("board", 21)}</span><div><button id="board-title" data-action="board-settings" class="board-title"></button><span class="board-meta" id="board-meta"></span></div>${iconButton("board-settings", "Board settings", "more")}</div><div class="board-heading-actions">${iconButton("undo", "Undo (⌘/Ctrl Z)", "undo", 'id="undo" disabled')}${iconButton("redo", "Redo (⌘/Ctrl Shift Z)", "redo", 'id="redo" disabled')}<span class="divider"></span>${button("export", "Export", "download", "secondary-button")}${button("commit", "Save to GitHub", "cloud", "primary-button", 'id="commit-button"')}</div></div>
+    <div class="board-heading"><div class="board-heading-left"><span class="board-symbol">${icon("board", 21)}</span><div><button id="board-title" data-action="board-settings" class="board-title"></button><span class="board-meta" id="board-meta"></span></div>${iconButton("board-settings", "Board settings", "more")}</div><div class="board-heading-actions">${iconButton("undo", "Undo (⌘/Ctrl Z)", "undo", 'id="undo" disabled')}${iconButton("redo", "Redo (⌘/Ctrl Shift Z)", "redo", 'id="redo" disabled')}<span class="divider"></span>${button("import", "Import", "upload", "secondary-button", 'title="Import a board or diagram"')}${button("export", "Export", "download", "secondary-button")}${button("commit", "Save to GitHub", "cloud", "primary-button", 'id="commit-button"')}</div></div>
     <section class="canvas-shell" aria-label="Whiteboard workspace">
       <div id="canvas" class="canvas"></div>
       <nav class="tools" aria-label="Drawing tools">
@@ -122,7 +124,7 @@ $("#app").innerHTML = `
     </section>
   </main>
   <input type="file" id="image-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
-  <input type="file" id="import-file" accept="application/json,.json" hidden>
+  <input type="file" id="import-file" accept="application/json,.json,.drawio,.xml,application/xml,text/xml,application/vnd.jgraph.mxfile" hidden>
 `;
 
 const editor = new BoardEditor($("#canvas"), {
@@ -224,13 +226,14 @@ function miniature(boardData) {
     minY = Math.min(...ys);
   const w = Math.max(300, ...items.map((i) => i.x + i.width - minX)),
     h = Math.max(180, ...items.map((i) => i.y + i.height - minY));
+  const previewStride = Math.max(1, Math.ceil(items.length / 160));
   return `<svg viewBox="${minX - 20} ${minY - 20} ${w + 40} ${h + 40}" aria-hidden="true">${items
-    .slice(0, 80)
+    .filter((i, index) => index % previewStride === 0)
     .map((i) => {
       if (["draw", "arrow", "line"].includes(i.type))
         return `<polyline points="${(i.points || []).map((p) => `${Number(p[0])},${Number(p[1])}`).join(" ")}" fill="none" stroke="${esc(i.stroke)}" stroke-width="3"/>`;
       if (i.type === "text")
-        return `<rect x="${i.x}" y="${i.y + 8}" width="${Math.min(i.width, i.text.length * i.fontSize * 0.3)}" height="${Math.min(i.fontSize, 16)}" rx="4" fill="${esc(i.stroke)}" opacity=".5"/>`;
+        return `<rect x="${i.x}" y="${i.y + 8}" width="${Math.min(i.width, i.text.length * i.fontSize * 0.3)}" height="${Math.min(i.fontSize, 16)}" rx="4" fill="${esc(i.textColor || i.stroke)}" opacity=".5"/>`;
       if (i.type === "image")
         return `<image href="${esc(i.src)}" x="${i.x}" y="${i.y}" width="${i.width}" height="${i.height}"/>`;
       return `<rect x="${i.x}" y="${i.y}" width="${i.width}" height="${i.height}" rx="${i.type === "sticky" ? 0 : 6}" fill="${esc(i.fill)}" stroke="${i.type === "frame" ? "#d8dbe1" : "none"}" stroke-width="2"/>`;
@@ -262,6 +265,7 @@ function renderSidebar(filter = $("#board-search").value) {
           `<button type="button" class="board-card ${b.id === activeBoardId ? "active" : ""}" data-board="${esc(b.id)}"><div class="board-thumbnail" id="thumb-${b.id}">${miniature(b)}</div><div class="board-card-name"><span>${esc(b.name)}</span>${b.id === activeBoardId ? '<span class="active-dot"></span>' : ""}</div><small>${b.items.length} objects${b.id === activeBoardId ? " · Open now" : ""}</small></button>`,
       )
       .join("") || '<p class="no-results">No boards found.</p>';
+  $("#board-list .board-card.active")?.scrollIntoView({ block: "nearest" });
   updateStatus();
 }
 function activate(pId, bId, resetHistory = false) {
@@ -293,7 +297,17 @@ function renderProperties(force = false) {
   )
     return;
   const i = currentSelection[0];
-  el.innerHTML = `<span class="selection-count">${currentSelection.length > 1 ? `${currentSelection.length} objects` : { sticky: "Sticky note", rect: "Rectangle", draw: "Drawing" }[i.type] || i.type[0].toUpperCase() + i.type.slice(1)}</span><span class="divider"></span><div class="swatches">${COLORS.map((c) => `<button type="button" data-fill="${c}" style="--swatch:${c}" class="swatch ${i.fill === c ? "selected" : ""}" title="Fill ${c}" aria-label="Fill ${c}"></button>`).join("")}<label class="custom-color" title="Custom fill"><input type="color" id="custom-fill" aria-label="Custom fill color" value="${/^#[0-9a-f]{6}$/i.test(i.fill) ? i.fill : "#ffffff"}">${icon("palette", 16)}</label></div><span class="divider"></span><label class="stroke-input" title="Stroke and text color"><input type="color" id="stroke-color" value="${/^#[0-9a-f]{6}$/i.test(i.stroke) ? i.stroke : "#353846"}" aria-label="Stroke and text color"></label><select id="font-size" aria-label="Font size">${[12, 16, 18, 20, 24, 28, 32, 40, 48, 64].map((n) => `<option value="${n}" ${n === i.fontSize ? "selected" : ""}>${n}</option>`).join("")}</select>${iconButton("bold", "Bold", "bold")}${iconButton("duplicate-selected", "Duplicate selected objects", "copy")}${iconButton("lock-selected", i.locked ? "Unlock objects" : "Lock objects", i.locked ? "unlock" : "lock")}${iconButton("front", "Bring to front", "front")}${iconButton("back", "Send to back", "back")}<span class="divider"></span>${iconButton("delete-selected", "Delete selected objects", "trash")}`;
+  el.innerHTML = `<span class="selection-count">${currentSelection.length > 1 ? `${currentSelection.length} objects` : { sticky: "Sticky note", rect: "Rectangle", draw: "Drawing" }[i.type] || i.type[0].toUpperCase() + i.type.slice(1)}</span><span class="divider"></span><div class="swatches">${COLORS.map((c) => `<button type="button" data-fill="${c}" style="--swatch:${c}" class="swatch ${i.fill === c ? "selected" : ""}" title="Fill ${c}" aria-label="Fill ${c}"></button>`).join("")}<label class="custom-color" title="Custom fill"><input type="color" id="custom-fill" aria-label="Custom fill color" value="${/^#[0-9a-f]{6}$/i.test(i.fill) ? i.fill : "#ffffff"}">${icon("palette", 16)}</label></div><span class="divider"></span><label class="stroke-input" title="Stroke and text color"><input type="color" id="stroke-color" value="${/^#[0-9a-f]{6}$/i.test(i.stroke) ? i.stroke : "#353846"}" aria-label="Stroke and text color"></label><select id="font-size" aria-label="Font size">${Array.from(
+    new Set([12, 16, 18, 20, 24, 28, 32, 40, 48, 64, i.fontSize]),
+  )
+    .sort((a, b) => a - b)
+    .map(
+      (n) =>
+        `<option value="${n}" ${n === i.fontSize ? "selected" : ""}>${n}</option>`,
+    )
+    .join(
+      "",
+    )}</select>${iconButton("bold", "Bold", "bold")}${iconButton("duplicate-selected", "Duplicate selected objects", "copy")}${iconButton("lock-selected", i.locked ? "Unlock objects" : "Lock objects", i.locked ? "unlock" : "lock")}${iconButton("front", "Bring to front", "front")}${iconButton("back", "Send to back", "back")}<span class="divider"></span>${iconButton("delete-selected", "Delete selected objects", "trash")}`;
   $("#custom-fill").oninput = (e) =>
     editor.updateSelected({ fill: e.target.value });
   $("#custom-fill").onchange = () => renderProperties(true);
@@ -412,7 +426,7 @@ function projectManager() {
   modal(
     "Your projects",
     "A home for every kind of idea.",
-    `<div class="project-list">${projects.map((p) => `<button type="button" data-project="${p.id}" class="project-row ${p.id === activeProjectId ? "selected" : ""}"><span class="project-avatar">${esc(p.name[0]?.toUpperCase())}</span><span><strong>${esc(p.name)}</strong><small>${p.boards.length} boards · ${p.repository ? esc(`${p.repository.owner}/${p.repository.repo}`) : "Local project"}</small></span>${icon(p.id === activeProjectId ? "check" : "right", 18)}</button>`).join("")}</div><div class="modal-action-grid">${button("new-project", "New project", "plus", "primary-button")}${button("project-settings", "Project settings", "folder", "secondary-button")}${button("import", "Import JSON", "upload", "secondary-button")}${button("github", "Import from GitHub", "github", "secondary-button")}</div>`,
+    `<div class="project-list">${projects.map((p) => `<button type="button" data-project="${p.id}" class="project-row ${p.id === activeProjectId ? "selected" : ""}"><span class="project-avatar">${esc(p.name[0]?.toUpperCase())}</span><span><strong>${esc(p.name)}</strong><small>${p.boards.length} boards · ${p.repository ? esc(`${p.repository.owner}/${p.repository.repo}`) : "Local project"}</small></span>${icon(p.id === activeProjectId ? "check" : "right", 18)}</button>`).join("")}</div><div class="modal-action-grid">${button("new-project", "New project", "plus", "primary-button")}${button("project-settings", "Project settings", "folder", "secondary-button")}${button("import", "Import file", "upload", "secondary-button")}${button("github", "Import from GitHub", "github", "secondary-button")}</div>`,
   );
 }
 function projectSettings() {
@@ -504,32 +518,119 @@ function exportDialog() {
     `<div class="export-options">${button("export-png", "PNG image", "image", "export-option")}${button("export-svg", "SVG vector", "frame", "export-option")}${button("export-board", "Board JSON", "board", "export-option")}${button("export-project", "Project JSON", "folder", "export-option")}</div><p class="help-note">JSON files preserve editable objects. Project backups include every board and embedded image.</p>`,
   );
 }
+function importDialog() {
+  modal(
+    "Bring your ideas in.",
+    "Import a diagram or pick up where you left off.",
+    `<div class="export-options">${button("import-drawio", "draw.io diagram", "board", "export-option")}${button("import-json", "GitBoard JSON", "folder", "export-option")}</div><p class="help-note">Choose a <strong>.drawio</strong> or <strong>.xml</strong> file to create an editable board for each diagram page. JSON imports restore GitBoard boards or projects.</p>`,
+  );
+}
+function chooseImport(format) {
+  if (importBusy) return toast("Your file is still importing.");
+  const input = $("#import-file");
+  input.accept =
+    format === "drawio"
+      ? ".drawio,.xml,application/xml,text/xml,application/vnd.jgraph.mxfile"
+      : ".json,application/json";
+  input.click();
+}
 async function importFile(file) {
+  if (importBusy)
+    throw new Error("Wait for the current file to finish importing.");
   if (file.size > 40_000_000)
     throw new Error(
-      "This file is too large. Import a project smaller than 40 MB.",
+      "This file is too large. Choose a file smaller than 40 MB.",
     );
-  const raw = JSON.parse(await file.text());
-  if (raw.schemaVersion === 1 && Array.isArray(raw.boards)) {
-    const p = validateProject(raw);
-    const old = projects.find((x) => x.id === p.id);
-    if (old) {
-      p.id = uid();
-      p.name += " (imported)";
+  const target = project();
+  importBusy = true;
+  try {
+    const source = await file.text();
+    if (
+      source.trimStart().startsWith("<") ||
+      /\.(drawio|xml)$/i.test(file.name)
+    ) {
+      const { boards: importedBoards, warnings } = await importDrawio(source, {
+        filename: file.name,
+      });
+      if (!projects.includes(target))
+        throw new Error(
+          "The destination project was removed. Choose a project and import again.",
+        );
+      if (target.boards.length + importedBoards.length > 200)
+        throw new Error(
+          "A project can contain up to 200 boards. Import this file into a new project.",
+        );
+      // Validate every page before adding anything to the existing project.
+      validateProject({
+        ...target,
+        boards: [...target.boards, ...importedBoards],
+      });
+      target.boards.push(...importedBoards);
+      target.updatedAt = date();
+      $("#modal").close();
+      activate(target.id, importedBoards[0].id);
+      editor.fit();
+      persist(true);
+      toast(
+        `Imported ${importedBoards.length} ${importedBoards.length === 1 ? "board" : "boards"} from draw.io.`,
+      );
+      if (warnings.length) {
+        modal(
+          "Your diagram is ready.",
+          "Some diagram features were simplified during import.",
+          `<ul class="import-notices">${warnings
+            .slice(0, 20)
+            .map((warning) => `<li>${esc(warning)}</li>`)
+            .join(
+              "",
+            )}</ul>${warnings.length > 20 ? `<p class="help-note">And ${warnings.length - 20} more notices.</p>` : ""}<div class="modal-footer">${button("close-modal", "Open board", null, "primary-button")}</div>`,
+        );
+      }
+      return;
     }
-    projects.push(p);
-    activate(p.id, p.boards[0].id);
-  } else if (raw.items && raw.id) {
-    const p = createProject("Import");
-    p.boards = [raw];
-    const b = validateProject(p).boards[0];
-    if (project().boards.some((x) => x.id === b.id)) b.id = uid();
-    project().boards.push(b);
-    project().updatedAt = date();
-    activate(project().id, b.id);
-  } else throw new Error("Choose a GitBoard project or board JSON file.");
-  $("#modal").close();
-  toast("Your import is ready to edit.");
+    let raw;
+    try {
+      raw = JSON.parse(source);
+    } catch {
+      throw new Error("Choose a valid GitBoard JSON or draw.io XML file.");
+    }
+    if (!raw || typeof raw !== "object")
+      throw new Error("Choose a GitBoard project or board JSON file.");
+    if (raw.schemaVersion === 1 && Array.isArray(raw.boards)) {
+      if (projects.length >= 200)
+        throw new Error("Your workspace can contain up to 200 projects.");
+      const p = validateProject(raw);
+      const old = projects.find((x) => x.id === p.id);
+      if (old) {
+        p.id = uid();
+        p.name += " (imported)";
+      }
+      projects.push(p);
+      activate(p.id, p.boards[0].id);
+    } else if (raw.items && raw.id) {
+      const p = createProject("Import");
+      p.boards = [raw];
+      const b = validateProject(p).boards[0];
+      if (!projects.includes(target))
+        throw new Error(
+          "The destination project was removed. Choose a project and import again.",
+        );
+      if (target.boards.some((x) => x.id === b.id)) b.id = uid();
+      if (target.boards.length >= 200)
+        throw new Error("A project can contain up to 200 boards.");
+      validateProject({ ...target, boards: [...target.boards, b] });
+      target.boards.push(b);
+      target.updatedAt = date();
+      activate(target.id, b.id);
+    } else
+      throw new Error(
+        "Choose a GitBoard project or board JSON file, or a draw.io diagram.",
+      );
+    $("#modal").close();
+    toast("Your import is ready to edit.");
+  } finally {
+    importBusy = false;
+  }
 }
 async function addImage(file) {
   const destinationBoardId = board().id;
@@ -905,7 +1006,13 @@ const actions = {
     editor.updateSelected({ locked: !currentSelection[0]?.locked }),
   bold: () =>
     editor.updateSelected({
-      fontWeight: currentSelection[0]?.fontWeight === 700 ? 400 : 700,
+      bold: !(
+        currentSelection[0]?.bold || currentSelection[0]?.fontWeight === 700
+      ),
+      fontWeight:
+        currentSelection[0]?.bold || currentSelection[0]?.fontWeight === 700
+          ? 400
+          : 700,
     }),
   front: () => editor.reorderSelected?.("front"),
   back: () => editor.reorderSelected?.("back"),
@@ -978,7 +1085,9 @@ const actions = {
       toast(e.message, true);
     }
   },
-  import: () => $("#import-file").click(),
+  import: importDialog,
+  "import-json": () => chooseImport("json"),
+  "import-drawio": () => chooseImport("drawio"),
   github: githubDialog,
   "create-repo": createRepoDialog,
   "import-repo": importRepoDialog,
